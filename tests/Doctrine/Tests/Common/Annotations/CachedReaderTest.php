@@ -5,21 +5,21 @@ namespace Doctrine\Tests\Common\Annotations;
 use Doctrine\Common\Annotations\AnnotationReader;
 use Doctrine\Common\Annotations\CachedReader;
 use Doctrine\Common\Annotations\Reader;
-use Doctrine\Common\Cache\ArrayCache;
-use Doctrine\Common\Cache\Cache;
 use Doctrine\Tests\Common\Annotations\Fixtures\Annotation\Route;
 use Doctrine\Tests\Common\Annotations\Fixtures\ClassThatUsesTraitThatUsesAnotherTraitWithMethods;
-use PHPUnit\Framework\MockObject\MockObject;
+use Psr\Cache\CacheItemInterface;
+use Psr\Cache\CacheItemPoolInterface;
 use ReflectionClass;
 use ReflectionMethod;
+use Symfony\Component\Cache\Adapter\ArrayAdapter;
 
-use function assert;
+use function str_replace;
 use function time;
 use function touch;
 
 class CachedReaderTest extends AbstractReaderTest
 {
-    /** @var int|ArrayCache */
+    /** @var CacheItemPoolInterface */
     private $cache;
 
     public function testIgnoresStaleCache(): void
@@ -150,7 +150,7 @@ class CachedReaderTest extends AbstractReaderTest
     public function testAvoidCallingFilemtimeTooMuch(): void
     {
         $className = ClassThatUsesTraitThatUsesAnotherTraitWithMethods::class;
-        $cacheKey  = $className;
+        $cacheKey  = str_replace('\\', '_', $className);
         $cacheTime = time() - 10;
 
         $cacheKeyMethod1 = $cacheKey . '#method1';
@@ -161,42 +161,54 @@ class CachedReaderTest extends AbstractReaderTest
         $route2          = new Route();
         $route2->pattern = '/someotherprefix';
 
-        $cache = $this->createMock('Doctrine\Common\Cache\Cache');
-        assert($cache instanceof Cache && $cache instanceof MockObject);
+        $cacheItem1 = $this->createMock(CacheItemInterface::class);
+        $cacheItem1
+            ->expects($this->any())
+            ->method('isHit')
+            ->willReturn(true);
+        $cacheItem1
+            ->expects($this->any())
+            ->method('get')
+            ->willReturn([$route1]);
 
+        $cacheItem2 = $this->createMock(CacheItemInterface::class);
+        $cacheItem2
+            ->expects($this->any())
+            ->method('isHit')
+            ->willReturn(true);
+        $cacheItem2
+            ->expects($this->any())
+            ->method('get')
+            ->willReturn([$route2]);
+
+        $timeCacheItem = $this->createMock(CacheItemInterface::class);
+        $timeCacheItem
+            ->expects($this->any())
+            ->method('isHit')
+            ->willReturn(true);
+        $timeCacheItem
+            ->expects($this->any())
+            ->method('get')
+            ->willReturn($cacheTime);
+
+        $cache = $this->createMock(CacheItemPoolInterface::class);
         $cache
-            ->expects($this->exactly(6))
-            ->method('fetch')
-            ->withConsecutive(
-                // first pass => cache ok for method 1
-                // we load annotations AND filemtimes for this file
-                [$this->equalTo($cacheKeyMethod1)],
-                [$this->equalTo('[C]' . $cacheKeyMethod1)],
-                // second pass => cache ok for method 2
-                // filemtime is seen as fresh even if it's not
-                [$this->equalTo($cacheKeyMethod2)],
-                [$this->equalTo('[C]' . $cacheKeyMethod2)],
-                // third pass => cache stale for method 2
-                // filemtime is seen as not fresh => we save
-                [$this->equalTo($cacheKeyMethod2)],
-                [$this->equalTo('[C]' . $cacheKeyMethod2)]
-            )
-            ->willReturnOnConsecutiveCalls(
-                [$route1], // Result was cached, but there was an annotation;
-                $cacheTime,
-                [$route2], // Result was cached, but there was an annotation;
-                $cacheTime,
-                [$route2], // Result was cached, but there was an annotation;
-                $cacheTime
-            );
-
+            ->expects($this->any())
+            ->method('getItem')
+            ->willReturnMap([
+                [$cacheKeyMethod1, $cacheItem1],
+                [$cacheKeyMethod2, $cacheItem2],
+                ['[C]' . $cacheKeyMethod1, $timeCacheItem],
+                ['[C]' . $cacheKeyMethod2, $timeCacheItem],
+            ]);
         $cache
             ->expects($this->exactly(2))
-            ->method('save')
+            ->method('saveDeferred')
             ->withConsecutive(
-                [$this->equalTo($cacheKeyMethod2)],
-                [$this->equalTo('[C]' . $cacheKeyMethod2)]
+                [$cacheItem1],
+                [$cacheItem2]
             );
+        $cache->expects($this->atLeastOnce())->method('commit');
 
         $reader = new CachedReader(new AnnotationReader(), $cache, true);
 
@@ -215,27 +227,41 @@ class CachedReaderTest extends AbstractReaderTest
 
     protected function doTestCacheStale(string $className, int $lastCacheModification): CachedReader
     {
-        $cacheKey = $className;
+        $cacheKey = str_replace('\\', '_', $className);
 
-        $cache = $this->createMock(Cache::class);
+        $cacheItem = $this->createMock(CacheItemInterface::class);
+        $cacheItem
+            ->expects($this->any())
+            ->method('isHit')
+            ->willReturn(true);
+        $cacheItem
+            ->expects($this->any())
+            ->method('get')
+            ->willReturn([]); // Result was cached, but there was no annotation
+
+        $timeCacheItem = $this->createMock(CacheItemInterface::class);
+        $timeCacheItem
+            ->expects($this->any())
+            ->method('isHit')
+            ->willReturn(true);
+        $timeCacheItem
+            ->expects($this->any())
+            ->method('get')
+            ->willReturn($lastCacheModification);
+
+        $cache = $this->createMock(CacheItemPoolInterface::class);
+        $cache
+            ->expects($this->any())
+            ->method('getItem')
+            ->willReturnMap([
+                [$cacheKey, $cacheItem],
+                ['[C]' . $cacheKey, $timeCacheItem],
+            ]);
         $cache
             ->expects($this->exactly(2))
-            ->method('fetch')
-            ->withConsecutive(
-                [$this->equalTo($cacheKey)],
-                [$this->equalTo('[C]' . $cacheKey)]
-            )
-            ->willReturnOnConsecutiveCalls(
-                [], // Result was cached, but there was no annotation
-                $lastCacheModification
-            );
-        $cache
-            ->expects($this->exactly(2))
-            ->method('save')
-            ->withConsecutive(
-                [$this->equalTo($cacheKey)],
-                [$this->equalTo('[C]' . $cacheKey)]
-            );
+            ->method('saveDeferred')
+            ->withConsecutive([$cacheItem], [$timeCacheItem]);
+        $cache->expects($this->once())->method('commit');
 
         $reader         = new CachedReader(new AnnotationReader(), $cache, true);
         $route          = new Route();
@@ -248,23 +274,40 @@ class CachedReaderTest extends AbstractReaderTest
 
     protected function doTestCacheFresh(string $className, int $lastCacheModification): void
     {
-        $cacheKey       = $className;
+        $cacheKey       = str_replace('\\', '_', $className);
         $route          = new Route();
         $route->pattern = '/someprefix';
 
-        $cache = $this->createMock('Doctrine\Common\Cache\Cache');
+        $cacheItem = $this->createMock(CacheItemInterface::class);
+        $cacheItem
+            ->expects($this->any())
+            ->method('isHit')
+            ->willReturn(true);
+        $cacheItem
+            ->expects($this->any())
+            ->method('get')
+            ->willReturn([$route]);
+
+        $timeCacheItem = $this->createMock(CacheItemInterface::class);
+        $timeCacheItem
+            ->expects($this->any())
+            ->method('isHit')
+            ->willReturn(true);
+        $timeCacheItem
+            ->expects($this->any())
+            ->method('get')
+            ->willReturn($lastCacheModification);
+
+        $cache = $this->createMock(CacheItemPoolInterface::class);
         $cache
-            ->expects($this->exactly(2))
-            ->method('fetch')
-            ->withConsecutive(
-                [$this->equalTo($cacheKey)],
-                [$this->equalTo('[C]' . $cacheKey)]
-            )
-            ->willReturnOnConsecutiveCalls(
-                [$route],
-                $lastCacheModification
-            );
+            ->expects($this->any())
+            ->method('getItem')
+            ->willReturnMap([
+                [$cacheKey, $cacheItem],
+                ['[C]' . $cacheKey, $timeCacheItem],
+            ]);
         $cache->expects(self::never())->method('save');
+        $cache->expects(self::never())->method('commit');
 
         $reader = new CachedReader(new AnnotationReader(), $cache, true);
 
@@ -273,7 +316,7 @@ class CachedReaderTest extends AbstractReaderTest
 
     protected function getReader(): Reader
     {
-        $this->cache = new ArrayCache();
+        $this->cache = new ArrayAdapter();
 
         return new CachedReader(new AnnotationReader(), $this->cache);
     }
